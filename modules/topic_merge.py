@@ -1,80 +1,66 @@
 # modules/topic_merge.py
 from __future__ import annotations
-import json, os, re, time
+import json
 from typing import Dict, List
-from modules.config import using_azure, OPENAI_MODEL, AZURE_OPENAI_DEPLOYMENT
+from .config import S, OPENAI_MODEL
 
 def _get_client_and_model():
-    if using_azure():
-        from openai import AzureOpenAI
-        client = AzureOpenAI(
-            api_key=(os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
-        )
-        model = os.getenv("OPENAI_TOPIC_MODEL") or AZURE_OPENAI_DEPLOYMENT or OPENAI_MODEL
-    else:
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        model = os.getenv("OPENAI_TOPIC_MODEL") or os.getenv("OPENAI_MODEL", OPENAI_MODEL)
-    return client, model
+    from openai import OpenAI
+    cli = OpenAI(api_key=S("OPENAI_API_KEY"))
+    model = S("OPENAI_MODEL", OPENAI_MODEL)
+    return cli, model
 
-def _extract_json(text: str) -> dict:
-    if not text: return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if m:
-            try: return json.loads(m.group(0))
-            except Exception: return {}
-    return {}
-
-_SYS_PROMPT = (
-    "أنت مسؤول عن توحيد تسميات المواضيع والكيانات بالعربية.\n"
-    "عند إعطائك مصطلحاً جديداً NEW_TERM وقائمة تسميات قياسية EXISTING، قرّر هل المصطلح مكافئ دلالياً لإحداها "
-    "(بما في ذلك اختلافات الوصف مثل مدينة/محافظة/منطقة أو city/province). إذا كان مكافئاً: action='merge' و canonical يجب أن يكون "
-    "عنصراً مطابقاً 100% من EXISTING. إن لم يكن مكافئاً: action='new' واقترح تسمية قياسية عربية موجزة.\n"
-    "أعد **فقط** JSON بهذا الشكل: {\"action\":\"merge\"|\"new\",\"canonical\":\"...\"}"
+_PROMPT = (
+    "You will receive a list of short labels (topics/entities). "
+    "Return a JSON object mapping EACH input label to a canonical merged label. "
+    "Merge near-duplicates, spell variants, plural/singular, Arabic/English equivalents, "
+    "and case/diacritic differences. Keep canonical labels short and human-friendly. "
+    "Keys must be original inputs (exact), values are their chosen canonical form. "
+    "Output ONLY a JSON object."
 )
 
-def _gpt_decide_merge(client, model: str, new_term: str, existing: List[str]) -> Dict[str, str]:
-    max_candidates = int(os.getenv("SEMANTIC_MERGE_MAX_CANDIDATES", "60"))
-    candidates = existing[-max_candidates:] if max_candidates > 0 else existing
-    payload = {"NEW_TERM": new_term, "EXISTING": candidates}
+def gpt_semantic_merge_terms(terms: List[str], batch_size: int = 120) -> Dict[str, str]:
+    """
+    Map each input term to a canonical label using a small LLM pass.
+    Safe: chunks inputs; falls back to identity mapping on any error.
+    """
+    cli, model = _get_client_and_model()
+    # Clean + stable order
+    seen = set()
+    items = []
+    for t in terms or []:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t); items.append(t)
+    if not items:
+        return {}
 
-    resp = client.chat.completions.create(
-        model=model, temperature=0,
-        response_format={"type": "json_object"},
-        messages=[{"role":"system","content":_SYS_PROMPT},
-                  {"role":"user","content":json.dumps(payload, ensure_ascii=False)}],
-    )
-    text = resp.choices[0].message.content if resp and resp.choices else ""
-    data = _extract_json(text)
-    action = (data.get("action") or "").strip().lower()
-    canonical = (data.get("canonical") or "").strip()
-    if action == "merge" and canonical in candidates:
-        return {"action":"merge","canonical":canonical}
-    if action == "new" and canonical:
-        return {"action":"new","canonical":canonical}
-    return {"action":"new","canonical":new_term}
-
-def gpt_semantic_merge_terms(terms: List[str], sleep_sec: float = 0.05) -> Dict[str, str]:
-    client, model = _get_client_and_model()
-    mapping: Dict[str, str] = {}
-    canon_list: List[str] = []
-    for term in terms:
-        t = (term or "").strip()
-        if not t or t in mapping: continue
+    out: Dict[str, str] = {}
+    for i in range(0, len(items), batch_size):
+        chunk = items[i:i+batch_size]
         try:
-            decision = _gpt_decide_merge(client, model, t, canon_list)
+            resp = cli.chat.completions.create(
+                model=model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": _PROMPT},
+                    {"role": "user", "content": json.dumps(chunk, ensure_ascii=False)},
+                ],
+            )
+            txt = resp.choices[0].message.content if resp and resp.choices else "{}"
+            data = json.loads(txt or "{}")
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    k2 = str(k).strip()
+                    v2 = str(v).strip()
+                    if k2:
+                        out[k2] = v2 if v2 else k2
+            else:
+                # Fallback: identity
+                for k in chunk:
+                    out[k] = k
         except Exception:
-            decision = {"action":"new","canonical":t}
-        action = decision.get("action"); canonical = decision.get("canonical") or t
-        if action == "merge":
-            mapping[t] = canonical
-        else:
-            canon_list.append(canonical)
-            mapping[t] = canonical
-        if sleep_sec: time.sleep(sleep_sec)
-    return mapping
+            for k in chunk:
+                out[k] = k
+    return out
