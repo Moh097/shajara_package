@@ -1,5 +1,5 @@
 # app.py
-import os, re, io, json, time, math, subprocess
+import os, re, io, json, subprocess
 from typing import Dict, Any, List
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,17 +10,12 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 
-from modules.config import (
-    DB_PATH, OPENAI_MODEL, using_azure, S, export_secrets_to_env
-)
+from modules.config import DB_PATH, OPENAI_MODEL, S, export_secrets_to_env
 from modules.data_access import fetch_telegram_posts
 from modules.tokenize import token_stats
 from modules.llm import analyze_text_gpt
 from modules.topic_merge import gpt_semantic_merge_terms
 from utils.sqlite_client import ensure_schema
-
-# ====== PRIME ENV WITH STREAMLIT SECRETS (for collectors/subprocesses) ======
-export_secrets_to_env()
 
 # Optional deps
 try:
@@ -28,7 +23,9 @@ try:
 except Exception:
     WordCloud = None
 
-# ---- Arabic font config (robust on Windows/Linux/Mac) ----
+# Prime env for subprocesses (collectors)
+export_secrets_to_env()
+
 def _register_ar_font() -> tuple[str | None, str | None]:
     env_path = (S("ARABIC_FONT_PATH", "") or "").strip()
     candidates_paths = [
@@ -51,11 +48,7 @@ def _register_ar_font() -> tuple[str | None, str | None]:
                 return p, name
             except Exception:
                 pass
-    candidate_families = [
-        "Noto Naskh Arabic", "Noto Sans Arabic", "Traditional Arabic",
-        "Tahoma", "Arial", "Times New Roman", "DejaVu Sans"
-    ]
-    for fam in candidate_families:
+    for fam in ["Noto Naskh Arabic","Noto Sans Arabic","Traditional Arabic","Tahoma","Arial","Times New Roman","DejaVu Sans"]:
         try:
             fm.findfont(fm.FontProperties(family=fam), fallback_to_default=False)
             plt.rcParams["font.family"] = [fam]
@@ -87,15 +80,14 @@ def _shape_ar(s: str) -> str:
     except Exception:
         return s or ""
 
-# ================== STREAMLIT UI ==================
+# ===== Streamlit UI =====
 st.set_page_config(page_title="SHAJARA", layout="wide")
 ensure_schema(DB_PATH)
 
-# ---------- Sidebar ----------
+# Sidebar
 st.sidebar.title("الإعدادات")
 db_path = st.sidebar.text_input("مسار قاعدة البيانات (SQLite)", value=S("SHAJARA_DB_PATH", DB_PATH))
 if db_path and db_path != os.environ.get("SHAJARA_DB_PATH", DB_PATH):
-    # store only in env for this session (don’t write back to secrets)
     os.environ["SHAJARA_DB_PATH"] = db_path
     ensure_schema(db_path)
 
@@ -105,22 +97,19 @@ since      = st.sidebar.text_input("من تاريخ (YYYY-MM-DD)", value="")
 until      = st.sidebar.text_input("إلى تاريخ (YYYY-MM-DD)", value="")
 limit_gpt  = st.sidebar.slider("حلّل أول N منشور", 10, 2000, 200, step=10)
 
-# Action buttons
+# Actions
 colb1, colb2, colb3 = st.sidebar.columns(3)
 run_click   = colb1.button("تشغيل التحليل")
 tg_click    = colb2.button("تشغيل جامع تيليجرام")
 fb_click    = colb3.button("تشغيل جامع فيسبوك")
 
-# One-shot run flag
 if run_click:
     st.session_state["RUN_ANALYSIS_ONCE"] = True
 run_analysis = st.session_state.pop("RUN_ANALYSIS_ONCE", False)
 
-# Collectors
 def _run_collector(script_rel: str):
     try:
         st.sidebar.info(f"تشغيل: {script_rel} ...")
-        # Env already carries st.secrets (export_secrets_to_env). No extra env needed.
         proc = subprocess.run(
             ["python", script_rel],
             capture_output=True, text=True, cwd=os.getcwd(), timeout=60*20
@@ -136,7 +125,7 @@ def _run_collector(script_rel: str):
 if tg_click: _run_collector("collectors/telegram_collector.py")
 if fb_click: _run_collector("collectors/facebook_collector.py")
 
-# ---------- Load data ----------
+# Data
 st.title("📡 شجرة — تحليل منشورات تيليجرام/فيسبوك")
 with st.spinner("جلب البيانات من SQLite..."):
     df = fetch_telegram_posts(
@@ -150,7 +139,7 @@ if df.empty:
     st.stop()
 st.success(f"تم تحميل {len(df)} صفاً من {os.environ.get('SHAJARA_DB_PATH', DB_PATH)}")
 
-# ---------- Quick stats ----------
+# Stats
 st.header("🧮 إحصاءات أساسية")
 def _row_stats(row) -> Dict[str, Any]:
     s = token_stats((row.get("text") or ""), model=S("OPENAI_MODEL", OPENAI_MODEL))
@@ -173,7 +162,7 @@ stat_df["words"].plot(kind="hist", bins=30)
 plt.title(_shape_ar("توزيع عدد الكلمات")); plt.xlabel(_shape_ar("كلمات")); plt.ylabel(_shape_ar("التكرار"))
 st.pyplot(fig)
 
-# ================== Helpers ==================
+# Helpers
 def parse_listlike(raw: Any) -> List[Any]:
     if raw is None: return []
     if isinstance(raw, list): return [x for x in raw if x is not None]
@@ -201,23 +190,14 @@ def extract_entities(x: Any) -> List[str]:
             if s: out.append(s)
     return out
 
+# Translation helper (OpenAI only)
 def _get_client_and_model():
-    if using_azure():
-        from openai import AzureOpenAI
-        cli = AzureOpenAI(
-            api_key=S("AZURE_OPENAI_API_KEY", S("OPENAI_API_KEY")),
-            azure_endpoint=S("AZURE_OPENAI_ENDPOINT"),
-            api_version=S("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
-        )
-        model = S("OPENAI_MODEL", "gpt-4o-mini")
-    else:
-        from openai import OpenAI
-        cli = OpenAI(api_key=S("OPENAI_API_KEY"))
-        model = S("OPENAI_MODEL", "gpt-4o-mini")
+    from openai import OpenAI
+    cli = OpenAI(api_key=S("OPENAI_API_KEY"))
+    model = S("OPENAI_MODEL", OPENAI_MODEL)
     return cli, model
 
 def translate_list_to_ar(items: List[str]) -> Dict[str,str]:
-    """Batch translate labels to Arabic. Returns mapping item->Arabic."""
     if not items: return {}
     cli, model = _get_client_and_model()
     out: Dict[str,str] = {}
@@ -254,17 +234,15 @@ def map_tension_ar(x: str) -> str:
     m = {"low":"منخفض","medium":"متوسط","high":"مرتفع"}
     return m.get(str(x).strip().lower(), str(x))
 
-# ================== RUN ANALYSIS ==================
+# Run analysis
 st.header("🧠 التحليل (المواضيع، الكيانات، الملخص، المشاعر)")
-
 if run_analysis:
-    # Initialize caches on MAIN thread (safe)
     if "gpt_cache" not in st.session_state:
         st.session_state["gpt_cache"] = {}
     if "ar_translate_cache" not in st.session_state:
         st.session_state["ar_translate_cache"] = {}
 
-    local_cache = dict(st.session_state["gpt_cache"])  # thread-safe copy
+    local_cache = dict(st.session_state["gpt_cache"])
     cache_lock = Lock()
 
     results: List[Dict] = []
@@ -285,7 +263,6 @@ if run_analysis:
             local_cache[key] = res
         return res
 
-    # Run GPT per-post in parallel (no session_state inside threads)
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(worker, i, df.iloc[i].get("text")): i for i in range(N)}
         done = 0
@@ -303,38 +280,30 @@ if run_analysis:
             progress.progress(int(done/N*100))
     progress.empty()
 
-    # Sync cache back on MAIN thread
-    st.session_state["gpt_cache"] = local_cache
-
     res_df = pd.DataFrame(results)
     st.subheader("النتائج")
     st.dataframe(res_df, use_container_width=True, height=360)
 
-    # Collect raw topics/entities
     all_topics_raw, all_entities_raw = [], []
     for r in results:
         all_topics_raw += extract_topics(r.get("topics"))
         all_entities_raw += extract_entities(r.get("entities"))
 
-    # Translate to Arabic (cached, main thread)
     to_translate = [t for t in set(all_topics_raw + all_entities_raw)
                     if t not in st.session_state["ar_translate_cache"]]
     if to_translate:
         st.session_state["ar_translate_cache"].update(translate_list_to_ar(to_translate))
     T = st.session_state["ar_translate_cache"]
 
-    # Arabic normalized uniq lists
     def to_ar(t: str) -> str: return T.get(t, t)
-    uniq_topics = sorted({to_ar(t).strip().lower() for t in all_topics_raw if to_ar(t)})
+    uniq_topics   = sorted({to_ar(t).strip().lower() for t in all_topics_raw if to_ar(t)})
     uniq_entities = sorted({to_ar(e).strip().lower() for e in all_entities_raw if to_ar(e)})
 
-    # Semantic merge (Arabic terms)
     topic_map = gpt_semantic_merge_terms(uniq_topics) if uniq_topics else {}
     if not topic_map: topic_map = {k:k for k in uniq_topics}
     ent_map = gpt_semantic_merge_terms(uniq_entities) if uniq_entities else {}
     if not ent_map: ent_map = {k:k for k in uniq_entities}
 
-    # Rewrite rows with Arabic + merged
     canon_results: List[Dict[str,Any]] = []
     for r in results:
         topics_ar = [to_ar(t).strip().lower() for t in extract_topics(r.get("topics")) if to_ar(t)]
@@ -355,25 +324,20 @@ if run_analysis:
     st.subheader("النتائج بعد التوحيد بالعربية")
     st.dataframe(res_df, use_container_width=True, height=360)
 
-    # Sentiment chart
     if "sentiment" in res_df.columns and res_df["sentiment"].notna().any():
         counts = res_df["sentiment"].value_counts(dropna=True)
-        fig2 = plt.figure()
-        counts.index = [_shape_ar(i) for i in counts.index]
+        fig2 = plt.figure(); counts.index = [_shape_ar(i) for i in counts.index]
         counts.plot(kind="bar")
         plt.title(_shape_ar("توزيع المشاعر")); plt.xlabel(_shape_ar("التصنيف")); plt.ylabel(_shape_ar("العدد"))
         st.pyplot(fig2)
 
-    # Tension chart
     if "tension" in res_df.columns and res_df["tension"].notna().any():
         counts = res_df["tension"].value_counts(dropna=True)
-        fig3 = plt.figure()
-        counts.index = [_shape_ar(i) for i in counts.index]
+        fig3 = plt.figure(); counts.index = [_shape_ar(i) for i in counts.index]
         counts.plot(kind="bar")
         plt.title(_shape_ar("مستويات التوتر")); plt.xlabel(_shape_ar("التصنيف")); plt.ylabel(_shape_ar("العدد"))
         st.pyplot(fig3)
 
-    # Top topics
     all_topics = []
     if "topics" in res_df.columns:
         for tlist in res_df["topics"].dropna():
@@ -382,13 +346,11 @@ if run_analysis:
     if all_topics:
         topics_df = pd.DataFrame({"topic": all_topics})
         top_topics = topics_df["topic"].value_counts().head(25)
-        fig4 = plt.figure()
-        top_topics.index = [_shape_ar(i) for i in top_topics.index]
+        fig4 = plt.figure(); top_topics.index = [_shape_ar(i) for i in top_topics.index]
         top_topics.plot(kind="bar")
         plt.title(_shape_ar("أكثر المواضيع تداولاً")); plt.xlabel(_shape_ar("الموضوع")); plt.ylabel(_shape_ar("العدد"))
         st.pyplot(fig4)
 
-    # Build graph + wordcloud in parallel
     def build_graph_html():
         from modules.viz import build_cooccurrence_graph
         return build_cooccurrence_graph(canon_results, top_k_terms=25, min_edge_weight=2)
@@ -404,12 +366,10 @@ if run_analysis:
             return None
         items = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:300]
         shaped = {_shape_ar(k): v for k, v in items}
-        from wordcloud import WordCloud as _WC  # ensure plugin import within guard
-        wc = _WC(
-            width=1300, height=550, background_color="white",
-            max_words=300, collocations=False, prefer_horizontal=1.0,
-            regexp=r"[\u0600-\u06FF\w-]+",
-            font_path=_wordcloud_font_path(),
+        from wordcloud import WordCloud as _WC
+        wc = _WC(width=1300, height=550, background_color="white",
+                 max_words=300, collocations=False, prefer_horizontal=1.0,
+                 regexp=r"[\u0600-\u06FF\w-]+", font_path=_wordcloud_font_path()
         ).generate_from_frequencies(shaped)
         buf = io.BytesIO(); wc.to_image().save(buf, format="PNG"); buf.seek(0)
         return buf
@@ -431,7 +391,6 @@ if run_analysis:
             st.image(img, use_container_width=True)
             st.download_button("تحميل صورة السحابة (PNG)", data=img, file_name="entities_wordcloud.png", mime="image/png")
 
-    # Export
     st.download_button(
         "تنزيل النتائج (CSV)",
         data=res_df.to_csv(index=False).encode("utf-8"),
