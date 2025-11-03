@@ -1,17 +1,10 @@
-# UI + data
-streamlit==1.39.0
-pandas==2.2.3
-numpy==2.1.2
-matplotlib==3.9.2
-python-dotenv==1.0.1
-
-# LLM
-openai==1.51.2
-tiktoken==0.7.0
-
-# Graph viz
-pyvis==0.3.2
-
-# Collectors
-telethon==1.36.0
-facebook-scraper==0.2.59
+streamlit>=1.37
+openai>=1.50
+telethon>=1.36
+pandas>=2.2
+matplotlib>=3.8
+arabic-reshaper>=3.0
+python-bidi>=0.4
+pyvis>=0.3
+networkx>=3.2
+wordcloud>=1.9

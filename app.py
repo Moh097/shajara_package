@@ -1,6 +1,6 @@
 # app.py
 import os, re, io, json, time, math, subprocess
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -10,12 +10,17 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 
-from modules.config import DB_PATH, using_azure
+from modules.config import (
+    DB_PATH, OPENAI_MODEL, using_azure, S, export_secrets_to_env
+)
 from modules.data_access import fetch_telegram_posts
 from modules.tokenize import token_stats
 from modules.llm import analyze_text_gpt
 from modules.topic_merge import gpt_semantic_merge_terms
 from utils.sqlite_client import ensure_schema
+
+# ====== PRIME ENV WITH STREAMLIT SECRETS (for collectors/subprocesses) ======
+export_secrets_to_env()
 
 # Optional deps
 try:
@@ -23,17 +28,9 @@ try:
 except Exception:
     WordCloud = None
 
-# ---- sanitize env (strip accidental quotes) ----
-def _strip_env(name: str):
-    v = os.getenv(name)
-    if v:
-        os.environ[name] = v.strip().strip('"').strip("'")
-for _k in ("OPENAI_API_KEY","OPENAI_MODEL","AZURE_OPENAI_API_KEY","AZURE_OPENAI_ENDPOINT"):
-    _strip_env(_k)
-
 # ---- Arabic font config (robust on Windows/Linux/Mac) ----
 def _register_ar_font() -> tuple[str | None, str | None]:
-    env_path = (os.getenv("ARABIC_FONT_PATH") or "").strip().strip('"').strip("'")
+    env_path = (S("ARABIC_FONT_PATH", "") or "").strip()
     candidates_paths = [
         env_path,
         r"C:\Windows\Fonts\arial.ttf",
@@ -96,8 +93,9 @@ ensure_schema(DB_PATH)
 
 # ---------- Sidebar ----------
 st.sidebar.title("الإعدادات")
-db_path = st.sidebar.text_input("مسار قاعدة البيانات (SQLite)", value=os.environ.get("SHAJARA_DB_PATH", DB_PATH))
+db_path = st.sidebar.text_input("مسار قاعدة البيانات (SQLite)", value=S("SHAJARA_DB_PATH", DB_PATH))
 if db_path and db_path != os.environ.get("SHAJARA_DB_PATH", DB_PATH):
+    # store only in env for this session (don’t write back to secrets)
     os.environ["SHAJARA_DB_PATH"] = db_path
     ensure_schema(db_path)
 
@@ -122,6 +120,7 @@ run_analysis = st.session_state.pop("RUN_ANALYSIS_ONCE", False)
 def _run_collector(script_rel: str):
     try:
         st.sidebar.info(f"تشغيل: {script_rel} ...")
+        # Env already carries st.secrets (export_secrets_to_env). No extra env needed.
         proc = subprocess.run(
             ["python", script_rel],
             capture_output=True, text=True, cwd=os.getcwd(), timeout=60*20
@@ -149,12 +148,12 @@ with st.spinner("جلب البيانات من SQLite..."):
 if df.empty:
     st.warning("لا توجد بيانات. شغّل أحد المجمعين من الشريط الجانبي.")
     st.stop()
-st.success(f"تم تحميل {len(df)} صفاً من {os.environ.get('SHAJARA_DB_PATH', 'shajara.db')}")
+st.success(f"تم تحميل {len(df)} صفاً من {os.environ.get('SHAJARA_DB_PATH', DB_PATH)}")
 
 # ---------- Quick stats ----------
 st.header("🧮 إحصاءات أساسية")
 def _row_stats(row) -> Dict[str, Any]:
-    s = token_stats((row.get("text") or ""), model=os.environ.get("OPENAI_MODEL"))
+    s = token_stats((row.get("text") or ""), model=S("OPENAI_MODEL", OPENAI_MODEL))
     s["id"] = row.get("id"); s["datetime_utc"] = row.get("datetime_utc"); s["source"] = row.get("source_name")
     return s
 
@@ -206,15 +205,15 @@ def _get_client_and_model():
     if using_azure():
         from openai import AzureOpenAI
         cli = AzureOpenAI(
-            api_key=(os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            api_key=S("AZURE_OPENAI_API_KEY", S("OPENAI_API_KEY")),
+            azure_endpoint=S("AZURE_OPENAI_ENDPOINT"),
+            api_version=S("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
         )
-        model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+        model = S("OPENAI_MODEL", "gpt-4o-mini")
     else:
         from openai import OpenAI
-        cli = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+        cli = OpenAI(api_key=S("OPENAI_API_KEY"))
+        model = S("OPENAI_MODEL", "gpt-4o-mini")
     return cli, model
 
 def translate_list_to_ar(items: List[str]) -> Dict[str,str]:
@@ -273,7 +272,7 @@ if run_analysis:
     N = min(int(limit_gpt), len(df))
 
     def worker(i: int, text: str) -> Dict[str, Any]:
-        key = f"{os.environ.get('OPENAI_MODEL','gpt')}|{hash(text or '')}"
+        key = f"{S('OPENAI_MODEL', OPENAI_MODEL)}|{hash(text or '')}"
         with cache_lock:
             cached = local_cache.get(key)
         if cached is not None:
@@ -405,7 +404,8 @@ if run_analysis:
             return None
         items = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:300]
         shaped = {_shape_ar(k): v for k, v in items}
-        wc = WordCloud(
+        from wordcloud import WordCloud as _WC  # ensure plugin import within guard
+        wc = _WC(
             width=1300, height=550, background_color="white",
             max_words=300, collocations=False, prefer_horizontal=1.0,
             regexp=r"[\u0600-\u06FF\w-]+",
@@ -428,7 +428,6 @@ if run_analysis:
             st.info("لا توجد كيانات كافية أو حزمة wordcloud غير مثبتة.")
         else:
             img = wc_buf.getvalue()
-            # FIX: use_container_width instead of deprecated use_column_width
             st.image(img, use_container_width=True)
             st.download_button("تحميل صورة السحابة (PNG)", data=img, file_name="entities_wordcloud.png", mime="image/png")
 
