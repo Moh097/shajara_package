@@ -1,103 +1,95 @@
+# modules/llm.py
 from __future__ import annotations
-import json, time, hashlib
-from typing import Dict, Any, List
+import json
+from typing import Any, Dict, List
 
-from .config import (
-    OPENAI_API_KEY, OPENAI_MODEL,
-    AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT,
-    using_azure
-)
+from .config import S, using_azure, OPENAI_MODEL
 
-# Lazy import to keep Streamlit fast on non-LLM views
-_client = None
-
-def _client_openai():
-    global _client
-    if _client:
-        return _client
-
+def _get_client_and_model():
+    """
+    Build an OpenAI (or Azure OpenAI) client using Streamlit secrets/env via config.S().
+    """
     if using_azure():
-        # Azure OpenAI via "OpenAI" client (new SDK)
         from openai import AzureOpenAI
-        _client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            api_version="2024-08-01-preview",
-            azure_endpoint=AZURE_OPENAI_ENDPOINT
+        cli = AzureOpenAI(
+            api_key=S("AZURE_OPENAI_API_KEY", S("OPENAI_API_KEY")),
+            azure_endpoint=S("AZURE_OPENAI_ENDPOINT"),
+            api_version=S("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
         )
+        model = S("OPENAI_MODEL", OPENAI_MODEL)
     else:
         from openai import OpenAI
-        _client = OpenAI(api_key=OPENAI_API_KEY)
-    return _client
+        cli = OpenAI(api_key=S("OPENAI_API_KEY"))
+        model = S("OPENAI_MODEL", OPENAI_MODEL)
+    return cli, model
 
-def _model_name():
-    return AZURE_OPENAI_DEPLOYMENT if using_azure() else OPENAI_MODEL
+_SYSTEM = (
+    "You are an NLP microservice. "
+    "Return a compact JSON object with keys exactly: "
+    'summary (string), topics (array of short strings), entities (array of strings), '
+    'sentiment ("positive"|"negative"|"neutral"), tension ("low"|"medium"|"high"). '
+    "No extra commentary."
+)
+
+def _empty() -> Dict[str, Any]:
+    return {"summary": "", "topics": [], "entities": [], "sentiment": "", "tension": ""}
 
 def analyze_text_gpt(text: str) -> Dict[str, Any]:
     """
-    Calls GPT to return JSON with:
-      sentiment: positive|negative|neutral
-      tension: low|medium|high
-      topics: [..]
-      entities: [{text, type}]
-      summary: string (max ~50 words)
-      language: iso639-1 (guess)
+    Analyze a single text and return a normalized dict:
+      {summary, topics[], entities[], sentiment, tension}
+    Uses Chat Completions with JSON response_format.
     """
-    if not text or not text.strip():
-        return {}
+    if not (text or "").strip():
+        return _empty()
 
-    client = _client_openai()
-    model = _model_name()
+    cli, model = _get_client_and_model()
 
-    sys_prompt = (
-        "You are a concise analyst for Arabic and English Telegram posts. "
-        "Return STRICT JSON with keys: sentiment, tension, topics, entities, summary, language. "
-        "sentiment ∈ {positive, negative, neutral}; tension ∈ {low, medium, high}. "
-        "topics: <=5 single- or bi-gram strings. entities: <=6 items with {text,type}. "
-        "summary: <=50 words. language: iso639-1 code."
-    )
-
-    user_prompt = f"Analyze the following post:\n---\n{text}\n---"
-
-    # Prefer JSON mode if available
     try:
-        resp = client.chat.completions.create(
+        resp = cli.chat.completions.create(
             model=model,
-            temperature=0.2,
+            temperature=0,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": _SYSTEM},
+                # Keep user content bounded (defensive against super long posts)
+                {"role": "user", "content": (text or "")[:8000]},
             ],
         )
-        content = resp.choices[0].message.content
-    except Exception:
-        # Fallback: ask for fenced JSON
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": sys_prompt + " If not in JSON mode, return only a minified JSON object."},
-                {"role": "user", "content": user_prompt}
-            ],
-        )
-        content = resp.choices[0].message.content
+        content = resp.choices[0].message.content if resp and resp.choices else "{}"
+        data = json.loads(content or "{}")
+    except Exception as e:
+        out = _empty()
+        out["error"] = str(e)
+        return out
 
-    # Parse JSON
-    try:
-        data = json.loads(content)
-    except Exception:
-        # last resort: try to extract {...}
-        import re
-        m = re.search(r"\{.*\}", content, re.S)
-        data = json.loads(m.group(0)) if m else {}
+    # Normalize + type-coerce
+    summary = data.get("summary") or ""
+    topics = data.get("topics") or []
+    entities = data.get("entities") or []
+    sentiment = (data.get("sentiment") or "").strip().lower()
+    tension = (data.get("tension") or "").strip().lower()
 
-    # light sanitization
-    out = {
-        "sentiment": (data.get("sentiment") or "").lower()[:8],
-        "tension": (data.get("tension") or "").lower()[:6],
-        "topics": data.get("topics") or [],
-        "entities": data.get("entities") or [],
-        "summary": data.get("summary") or "",
-        "language": (data.get("language") or "").lower()[:5],
+    if isinstance(topics, str):
+        topics = [topics]
+    if isinstance(entities, str):
+        entities = [entities]
+
+    # De-dup, keep order
+    def _dedup(seq: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for s in seq:
+            s = (s or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    return {
+        "summary": str(summary),
+        "topics": _dedup([str(t) for t in topics]),
+        "entities": _dedup([str(e) for e in entities]),
+        "sentiment": sentiment if sentiment in {"positive", "negative", "neutral"} else "",
+        "tension": tension if tension in {"low", "medium", "high"} else "",
     }
-    return out
