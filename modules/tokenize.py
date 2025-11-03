@@ -1,41 +1,52 @@
+# modules/tokenize.py
+from __future__ import annotations
 import re
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any
 
+# Try to import tiktoken; fall back if missing
 try:
-    import tiktoken
+    import tiktoken  # type: ignore
+    _HAS_TIKTOKEN = True
 except Exception:
     tiktoken = None
+    _HAS_TIKTOKEN = False
 
-_AR_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)  # words (includes Arabic letters)
-_WS = re.compile(r"\s+")
+# Map models to encodings (proxy for OpenAI models)
+_MODEL_TO_ENCODING = {
+    None: "cl100k_base",
+    "gpt-4o": "cl100k_base",
+    "gpt-4o-mini": "cl100k_base",
+    "gpt-4o-mini-2024-07-18": "cl100k_base",
+}
 
-def simple_tokenize(text: str) -> List[str]:
+_WORD_RE = re.compile(r"\w+|\S", re.UNICODE)
+
+def _estimate_tokens(text: str) -> int:
     """
-    Regex-based word tokenizer (unicode letters), language-agnostic.
+    Fallback: ~1 token per 4 chars blended with word count.
+    This is good enough for charts when tiktoken isn't available.
     """
     if not text:
-        return []
-    return _AR_WORD.findall(text)
+        return 0
+    approx = max(1, int(len(text) / 4))
+    words = len(_WORD_RE.findall(text))
+    return int(0.6 * approx + 0.4 * words)
 
-def token_stats(text: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Compute basic stats + optional GPT token count if tiktoken available.
-    """
-    tokens = simple_tokenize(text)
-    s = {
-        "words": len(tokens),
-        "chars": len(text or ""),
-        "preview": text[:120].replace("\n", " ") if text else "",
-    }
-    if tiktoken and model:
+def token_stats(text: str, model: str | None = None) -> Dict[str, Any]:
+    text = text or ""
+    chars = len(text)
+    words = len(_WORD_RE.findall(text))
+    if _HAS_TIKTOKEN:
+        enc_name = _MODEL_TO_ENCODING.get((model or "").strip() or None, "cl100k_base")
         try:
-            enc = tiktoken.encoding_for_model(model)
+            enc = tiktoken.get_encoding(enc_name)
+            toks = len(enc.encode(text))
         except Exception:
-            enc = tiktoken.get_encoding("cl100k_base")
-        try:
-            s["gpt_tokens"] = len(enc.encode(text or ""))
-        except Exception:
-            s["gpt_tokens"] = None
+            toks = _estimate_tokens(text)
     else:
-        s["gpt_tokens"] = None
-    return s
+        toks = _estimate_tokens(text)
+    return {
+        "chars": chars,
+        "words": words,
+        "gpt_tokens": toks,
+    }
