@@ -489,7 +489,7 @@ if run_analysis:
         if top_topics_fig is not None:
             st.pyplot(top_topics_fig)
 
-        st.subheader("Co-occurrence Graph (PyVis)")
+        st.subheader("Co-occurrence Graph")
         st.components.v1.html(graph_html, height=700, scrolling=True)
 
         st.subheader("Word Cloud — Entities")
