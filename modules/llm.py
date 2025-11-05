@@ -1,66 +1,68 @@
 # modules/llm.py
 from __future__ import annotations
 import json
-from typing import Any, Dict, List
+from typing import Dict, Any
+from openai import OpenAI
+
 from .config import S, OPENAI_MODEL
 
-def _get_client_and_model():
-    from openai import OpenAI
+def _client_and_model():
     cli = OpenAI(api_key=S("OPENAI_API_KEY"))
     model = S("OPENAI_MODEL", OPENAI_MODEL)
     return cli, model
 
-_SYSTEM = (
-    "You are an NLP microservice. "
-    "Return a compact JSON object with keys exactly: "
-    'summary (string), topics (array of short strings), entities (array of strings), '
-    'sentiment ("positive"|"negative"|"neutral"), tension ("low"|"medium"|"high"). '
-    "No extra commentary."
-)
-
-def _empty() -> Dict[str, Any]:
-    return {"summary": "", "topics": [], "entities": [], "sentiment": "", "tension": ""}
-
 def analyze_text_gpt(text: str) -> Dict[str, Any]:
-    if not (text or "").strip():
-        return _empty()
-    cli, model = _get_client_and_model()
-    try:
-        resp = cli.chat.completions.create(
-            model=model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": (text or "")[:8000]},
-            ],
-        )
-        content = resp.choices[0].message.content if resp and resp.choices else "{}"
-        data = json.loads(content or "{}")
-    except Exception as e:
-        out = _empty(); out["error"] = str(e); return out
-
-    summary = data.get("summary") or ""
-    topics = data.get("topics") or []
-    entities = data.get("entities") or []
-    sentiment = (data.get("sentiment") or "").strip().lower()
-    tension = (data.get("tension") or "").strip().lower()
-
-    if isinstance(topics, str): topics = [topics]
-    if isinstance(entities, str): entities = [entities]
-
-    def _dedup(seq: List[str]) -> List[str]:
-        seen, out = set(), []
-        for s in seq:
-            s = (s or "").strip()
-            if s and s not in seen:
-                seen.add(s); out.append(s)
-        return out
-
-    return {
-        "summary": str(summary),
-        "topics": _dedup([str(t) for t in topics]),
-        "entities": _dedup([str(e) for e in entities]),
-        "sentiment": sentiment if sentiment in {"positive", "negative", "neutral"} else "",
-        "tension": tension if tension in {"low", "medium", "high"} else "",
+    """
+    Return a dict with keys:
+      - topics: List[str] (short English tags)
+      - entities: List[str] (plain English surface forms)
+      - summary: str (<= 3 sentences, English)
+      - sentiment: one of {"positive","neutral","negative"}
+      - tension: one of {"low","medium","high"}  (heuristic "intensity" scale)
+    All outputs MUST be English.
+    """
+    cli, model = _client_and_model()
+    payload = {
+        "instruction": (
+            "You are an information extraction assistant. "
+            "Extract concise English topics (as short tags), named entities (surface forms only), "
+            "a brief English summary (max 3 sentences), overall sentiment (positive/neutral/negative), "
+            "and an intensity scale called 'tension' (low/medium/high). "
+            "Return a strict JSON object with keys exactly: topics, entities, summary, sentiment, tension. "
+            "Do not include any explanations."
+        ),
+        "input": (text or "")[:10000]  # safety cap
     }
+    resp = cli.chat.completions.create(
+        model=model,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "Respond in English only. Output must be valid JSON."},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+        ],
+    )
+    raw = resp.choices[0].message.content if resp and resp.choices else "{}"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+
+    # Normalize structure
+    topics = data.get("topics") or []
+    if isinstance(topics, str): topics = [topics]
+    entities = data.get("entities") or []
+    if isinstance(entities, str): entities = [entities]
+    out = {
+        "topics": [str(t).strip() for t in topics if str(t).strip()],
+        "entities": [str(e).strip() for e in entities if str(e).strip()],
+        "summary": str(data.get("summary") or "").strip(),
+        "sentiment": (str(data.get("sentiment") or "").strip().lower() or "neutral"),
+        "tension": (str(data.get("tension") or "").strip().lower() or "medium"),
+    }
+    # Guard sentiment/tension values
+    if out["sentiment"] not in {"positive","neutral","negative"}:
+        out["sentiment"] = "neutral"
+    if out["tension"] not in {"low","medium","high"}:
+        out["tension"] = "medium"
+    return out

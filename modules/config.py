@@ -1,54 +1,79 @@
-# modules/config.py
 from __future__ import annotations
-import os
-import pathlib
-from typing import Any, Dict
+import os, json
+from pathlib import Path
 
-def _load_streamlit_secrets() -> Dict[str, Any]:
-    # Try Streamlit runtime
-    try:
-        import streamlit as st  # type: ignore
-        if hasattr(st, "secrets"):
-            try:
-                return dict(st.secrets)
-            except Exception:
-                return {k: st.secrets[k] for k in st.secrets}
-    except Exception:
-        pass
-    # Try local .streamlit/secrets.toml for non-Streamlit runs
-    try:
-        import tomllib  # py311+
-        candidates = [
-            pathlib.Path.cwd() / ".streamlit" / "secrets.toml",
-            pathlib.Path(__file__).resolve().parents[1] / ".streamlit" / "secrets.toml",
-        ]
-        for p in candidates:
-            if p.is_file():
-                return tomllib.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+try:
+    import tomllib  # py>=3.11
+except Exception:
+    tomllib = None
 
-_SECRETS: Dict[str, Any] = _load_streamlit_secrets()
+# Project root (shajara_package/)
+_BASE_DIR = Path(__file__).resolve().parents[1]
 
-def _sanitize(v: Any) -> Any:
-    return v.strip().strip('"').strip("'") if isinstance(v, str) else v
+# Defaults
+DB_PATH = str(_BASE_DIR / "shajara.db")
+OPENAI_MODEL = "gpt-4o-mini"
 
-def S(key: str, default: Any = None) -> Any:
-    """Secrets > env > default (strings sanitized)."""
-    if key in _SECRETS:
-        return _sanitize(_SECRETS[key])
-    envv = os.getenv(key)
-    return _sanitize(envv) if envv is not None else default
+# Cache
+_SECRETS = None
 
-def export_secrets_to_env(keys: list[str] | None = None) -> None:
-    """Expose secrets to os.environ so subprocesses inherit them."""
-    if not _SECRETS:
+def _secrets_path() -> Path | None:
+    # 1) explicit override
+    p = os.getenv("STREAMLIT_SECRETS_PATH")
+    if p and Path(p).exists():
+        return Path(p)
+    # 2) standard location
+    candidate = _BASE_DIR / ".streamlit" / "secrets.toml"
+    return candidate if candidate.exists() else None
+
+def _load_streamlit_secrets() -> dict:
+    global _SECRETS
+    if _SECRETS is not None:
+        return _SECRETS
+    path = _secrets_path()
+    if not path:
+        _SECRETS = {}
+        return _SECRETS
+    if tomllib is None:
+        # minimal TOML loader fallback (very permissive): treat as key="value" lines
+        data: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                data[k.strip()] = v.strip().strip('"').strip("'")
+        _SECRETS = data
+        return _SECRETS
+    with path.open("rb") as f:
+        _SECRETS = tomllib.load(f) or {}
+    return _SECRETS
+
+def S(key: str, default=None):
+    """Read from env first, then secrets.toml, else default."""
+    if key in os.environ:
+        return os.environ[key]
+    sec = _load_streamlit_secrets()
+    # flat or top-level only
+    if isinstance(sec, dict) and key in sec:
+        v = sec[key]
+        # normalize lists/dicts to JSON strings for consistency
+        if isinstance(v, (list, dict)):
+            return json.dumps(v, ensure_ascii=False)
+        return str(v)
+    return default
+
+def export_secrets_to_env():
+    """Copy secrets.toml into os.environ (strings only; lists/dicts JSON)."""
+    sec = _load_streamlit_secrets()
+    if not isinstance(sec, dict):
         return
-    for k in (keys or list(_SECRETS.keys())):
-        if os.getenv(k) is None and k in _SECRETS and not isinstance(_SECRETS[k], (dict, list)):
-            os.environ[k] = str(_SECRETS[k])
+    for k, v in sec.items():
+        if isinstance(v, (list, dict)):
+            os.environ[k] = json.dumps(v, ensure_ascii=False)
+        elif v is None:
+            continue
+        else:
+            os.environ[k] = str(v)
 
-# No Azure. Only OpenAI.
-OPENAI_MODEL: str = S("OPENAI_MODEL", "gpt-4o-mini")
-DB_PATH: str = S("SHAJARA_DB_PATH", "shajara.db")
+    # backfill defaults if still missing
+    os.environ.setdefault("SHAJARA_DB_PATH", DB_PATH)
+    os.environ.setdefault("OPENAI_MODEL", OPENAI_MODEL)

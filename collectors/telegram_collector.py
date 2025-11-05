@@ -1,229 +1,123 @@
 # collectors/telegram_collector.py
-# Telegram → SQLite (env-only; cron-friendly)
-
 from __future__ import annotations
-import os, sys, asyncio, hashlib
-from datetime import datetime, timezone
-from typing import Dict, Any, List
+import os, sys, json, asyncio, logging
+from pathlib import Path
+from datetime import timezone
+from typing import List, Tuple
 
-# Make package imports work when called as a script
-HERE = os.path.dirname(__file__)
-PKG_ROOT = os.path.abspath(os.path.join(HERE, ".."))
-if PKG_ROOT not in sys.path:
-    sys.path.insert(0, PKG_ROOT)
+# ---- Make sure sibling packages (modules/, utils/) are importable when run directly
+ROOT = Path(__file__).resolve().parents[1]  # .../shajara_package
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import User
+from telethon.tl.custom import Message  # type: ignore
 
-from utils.sqlite_client import upsert_posts, ensure_schema
-from modules.config import DB_PATH
+from modules.config import export_secrets_to_env, S
+from utils.sqlite_client import ensure_schema, upsert_posts
 
-# ---------------- Time helpers (aware UTC, RFC3339) ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("tg_collector")
 
-def utc_now_iso() -> str:
-    # ISO-8601 with 'Z', seconds precision
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-def to_utc_iso(dt: datetime) -> str:
-    if dt is None:
-        return ""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (
-        dt.astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-# ---------------- Env helpers ----------------
-
-def _get_env(name: str, default: str = "") -> str:
-    v = os.environ.get(name, default)
-    if isinstance(v, str):
-        # strip accidental quotes/spaces in .env
-        return v.strip().strip('"').strip("'")
-    return v
-
-API_ID_STR = _get_env("TELEGRAM_API_ID", "")
-API_HASH   = _get_env("TELEGRAM_API_HASH", "")
-STRING     = _get_env("TELEGRAM_STRING_SESSION", "")
-
-# Optional local file fallback for the string session
-SESSION_FILE = _get_env("TELEGRAM_SESSION_FILE", ".telegram_session")
-if not STRING and os.path.exists(SESSION_FILE):
+def _parse_channels(raw: str | None) -> List[str]:
+    if not raw:
+        return []
+    raw = raw.strip()
+    if not raw:
+        return []
     try:
-        with open(SESSION_FILE, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
-            if raw:
-                STRING = raw
-                print("Info: Loaded TELEGRAM_STRING_SESSION from local file.")
-    except Exception as e:
-        print("Warning: couldn't read local session file:", e)
-
-if not API_ID_STR or not API_HASH:
-    print("ERROR: TELEGRAM_API_ID or TELEGRAM_API_HASH is missing.")
-    raise SystemExit(2)
-try:
-    API_ID = int(API_ID_STR)
-except Exception:
-    print("ERROR: TELEGRAM_API_ID must be an integer.")
-    raise SystemExit(2)
-if not STRING:
-    print("ERROR: TELEGRAM_STRING_SESSION is missing.")
-    raise SystemExit(2)
-
-print(f"DEBUG: TELEGRAM_STRING_SESSION length = {len(STRING)} (masked).")
-
-# Channels / limits / prefilter
-CHANNELS   = [c.strip() for c in _get_env("TG_CHANNELS", "dmski_1,akbardrwz,Druzeresistance").split(",") if c.strip()]
-MAX_POSTS  = int(_get_env("TG_MAX_POSTS", "200"))
-PREFILTER  = [k for k in _get_env("TG_PREFILTER", "السويداء,الساحل,اللاذقية,طرطوس,قتل,اشتباك,طائفي").split(",") if k]
-
-# ---------------- Message helpers ----------------
-
-def build_urls(message) -> tuple[str, str]:
-    """
-    Best-effort to produce public t.me links when possible.
-    Falls back to /c/<id>/<msg> format for private/supergroup cases.
-    """
-    source_url = ""
-    post_url   = ""
-
-    chat = getattr(message, "chat", None)
-    uname = getattr(chat, "username", None) if chat else None
-    if uname:  # public channel/group
-        source_url = f"https://t.me/{uname}"
-        post_url   = f"https://t.me/{uname}/{message.id}"
-        return source_url, post_url
-
-    # private/supergroup: try to derive numeric id
-    chan_id = None
-    if hasattr(message, "peer_id") and hasattr(message.peer_id, "channel_id"):
-        chan_id = message.peer_id.channel_id
-    elif chat and hasattr(chat, "id"):
-        try:
-            chan_id = abs(int(chat.id))
-        except Exception:
-            chan_id = None
-
-    if chan_id:
-        source_url = f"https://t.me/c/{chan_id}"
-        post_url   = f"https://t.me/c/{chan_id}/{message.id}"
-
-    return source_url, post_url
-
-def extract_row(message) -> Dict[str, Any]:
-    # Timestamp
-    msg_date = to_utc_iso(getattr(message, "date", None))
-
-    # Source/channel title
-    source_name = ""
-    chat = getattr(message, "chat", None)
-    if chat and getattr(chat, "title", None):
-        source_name = chat.title
-
-    # Author (if available)
-    author = ""
-    try:
-        if message.sender and isinstance(message.sender, User):
-            if message.sender.username:
-                author = message.sender.username
-            elif message.sender.first_name and message.sender.last_name:
-                author = f"{message.sender.first_name} {message.sender.last_name}"
-            elif message.sender.first_name:
-                author = message.sender.first_name
+        obj = json.loads(raw)
+        if isinstance(obj, list):
+            return [str(x).strip() for x in obj if str(x).strip()]
     except Exception:
         pass
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    return parts
 
-    # Content
-    text = getattr(message, "text", None) or getattr(message, "message", "") or ""
-
-    # URLs
-    source_url, post_url = build_urls(message)
-
-    # Row (keep the same schema you already use)
-    return {
-        "platform": "Telegram",
-        "platform_post_id": str(message.id),
-        "source_name": source_name,
-        "source_url": source_url,
-        "post_id": str(message.id),
-        "post_url": post_url,
-        "author": author,
-        "text": text,
-        "language": "ar",
-        "datetime_utc": msg_date,
-        "datetime_local": "",
-        "admin_area": "",
-        "locality": "",
-        "geofenced_area": "",
-        "tension_level": "",
-        "media_urls": "Media present (URL TBD)" if getattr(message, "media", None) else "",
-        "shares": None,
-        "likes": None,
-        "comments": None,
-        "collected_at_utc": utc_now_iso(),
-        "collector": "SHAJARA-Agent",
-        "hash": hashlib.sha256((text or "").encode("utf-8")).hexdigest() if text else None,
-        "notes": "",
-    }
-
-# ---------------- Main async run ----------------
-
-async def run() -> None:
-    ensure_schema(DB_PATH)
-    rows: List[Dict[str, Any]] = []
-
+def _msg_metrics(m: Message) -> Tuple[int, int, int]:
+    likes = 0
+    shares = 0
+    comments = 0
     try:
-        async with TelegramClient(StringSession(STRING), API_ID, API_HASH) as client:
-            print("Telegram client started — fetching messages...")
-            for ch in CHANNELS:
-                if not ch:
-                    continue
-                print(f"Scanning channel: {ch}")
-                try:
-                    async for message in client.iter_messages(ch):
-                        if len(rows) >= MAX_POSTS:
-                            break
-                        # only text posts (or with text + media)
-                        t = getattr(message, "text", None) or getattr(message, "message", None)
-                        if not t:
-                            continue
+        if getattr(m, "reactions", None) and getattr(m.reactions, "results", None):
+            likes = sum(int(r.count or 0) for r in m.reactions.results)
+    except Exception:
+        pass
+    try:
+        if getattr(m, "forwards", None) is not None:
+            shares = int(m.forwards or 0)
+    except Exception:
+        pass
+    try:
+        if getattr(m, "replies", None) and getattr(m.replies, "replies", None) is not None:
+            comments = int(m.replies.replies or 0)
+    except Exception:
+        pass
+    return likes, shares, comments
 
-                        # Prefilter by simple keyword list (fast throttle)
-                        if PREFILTER:
-                            if not any(k in t for k in PREFILTER):
-                                # Sample 10% of non-matching posts to keep some variety
-                                if (message.id % 10) != 0:
-                                    continue
+async def _collect_for_channel(client: TelegramClient, channel: str, limit: int) -> List[tuple]:
+    ent = await client.get_entity(channel)
+    rows: List[tuple] = []
+    cnt = 0
+    async for m in client.iter_messages(ent, limit=limit):
+        if not isinstance(m, Message):
+            continue
+        text = (m.message or "")
+        dt = m.date.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if m.date else ""
+        author = ""
+        try:
+            author = (getattr(m, "post_author", None)
+                      or (m.sender.username if getattr(m, "sender", None) and getattr(m.sender, "username", None) else "")
+                      or (m.sender.first_name if getattr(m, "sender", None) and getattr(m.sender, "first_name", None) else "")
+                      or "")
+        except Exception:
+            pass
+        likes, shares, comments = _msg_metrics(m)
+        uid = f"tg:{channel}:{m.id}"
+        rows.append((uid, dt, "telegram", author, text, likes, shares, comments))
+        cnt += 1
+    log.info("Channel %s -> fetched %d messages", channel, cnt)
+    return rows
 
-                        rows.append(extract_row(message))
+async def main():
+    export_secrets_to_env()
+    ensure_schema(None)
 
-                    if len(rows) >= MAX_POSTS:
-                        break
-                except Exception as e:
-                    print(f"Warning: failed scanning {ch}: {e}")
-    except Exception as e:
-        print(f"ERROR: Telegram client failed to start or authenticate: {e}")
+    api_id = S("TELEGRAM_API_ID")
+    api_hash = S("TELEGRAM_API_HASH")
+    session = S("TELEGRAM_STRING_SESSION")
+    channels_raw = os.environ.get("TELEGRAM_CHANNELS") or S("TELEGRAM_CHANNELS", "")
+    max_fetch = int(S("TELEGRAM_MAX_FETCH", "1000"))
+
+    if not api_id or not api_hash or not session:
+        raise RuntimeError("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_STRING_SESSION in secrets.toml")
+    try:
+        api_id = int(api_id)
+    except Exception:
+        raise RuntimeError("TELEGRAM_API_ID must be an integer")
+
+    channels = _parse_channels(channels_raw)
+    if not channels:
+        raise RuntimeError("No channels specified. Set TELEGRAM_CHANNELS (env or .streamlit/secrets.toml)")
+
+    log.info("Connecting to Telegram...")
+    async with TelegramClient(StringSession(session), api_id, api_hash) as client:
+        client.parse_mode = "html"
+        all_rows: List[tuple] = []
+        for ch in channels:
+            try:
+                rows = await _collect_for_channel(client, ch, limit=max_fetch)
+                all_rows.extend(rows)
+            except Exception as e:
+                log.error("Failed channel %s: %s", ch, e)
+
+    if not all_rows:
+        log.warning("No messages collected.")
         return
 
-    if rows:
-        try:
-            n = upsert_posts(rows, db_path=DB_PATH)
-            print(f"Upserted {n} Telegram rows into SQLite: {DB_PATH}")
-        except Exception as e:
-            print(f"ERROR: SQLite upsert failed: {e}")
-    else:
-        print("No Telegram rows collected.")
-
-# ---------------- Entrypoint ----------------
+    inserted = upsert_posts(all_rows)
+    log.info("Upserted %d rows into SQLite (%s)", inserted, os.environ.get("SHAJARA_DB_PATH"))
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())

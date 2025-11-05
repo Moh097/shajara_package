@@ -1,99 +1,212 @@
-# modules/viz.py
 from __future__ import annotations
-import json, re
-from collections import Counter
-from typing import Any, Dict, List, Tuple
+import json
+import itertools
+from typing import List, Dict, Any
+from collections import Counter, defaultdict
+
+import networkx as nx
 from pyvis.network import Network
 
-def _cooccurrence(topics_by_post: List[List[str]]) -> Tuple[Counter, Counter]:
-    term_freq, edge_freq = Counter(), Counter()
-    for terms in topics_by_post:
-        if not terms:
-            continue
-        uniq = sorted(set(terms))
-        term_freq.update(uniq)
-        for i in range(len(uniq)):
-            for j in range(i + 1, len(uniq)):
-                edge_freq[(uniq[i], uniq[j])] += 1
-    return term_freq, edge_freq
+
+def _norm_token(x: Any) -> str:
+    try:
+        s = str(x).strip().lower()
+    except Exception:
+        s = ""
+    return s
+
+
+def _collect_terms(rows: List[Dict[str, Any]]) -> Counter:
+    """Count terms once per row (topics + entities)."""
+    freq = Counter()
+    for r in rows:
+        topics = r.get("topics") or []
+        entities = r.get("entities") or []
+        pool = set()
+        for t in topics:
+            tok = _norm_token(t)
+            if tok:
+                pool.add(tok)
+        for e in entities:
+            tok = _norm_token(e)
+            if tok:
+                pool.add(tok)
+        for tok in pool:
+            freq[tok] += 1
+    return freq
+
+
+def _cooccur_edges(rows: List[Dict[str, Any]], allowed: set[str]) -> Counter:
+    """Build co-occurrence counts for unordered pairs within each row."""
+    edges = Counter()
+    for r in rows:
+        topics = r.get("topics") or []
+        entities = r.get("entities") or []
+        pool = []
+        for t in topics:
+            tok = _norm_token(t)
+            if tok and tok in allowed:
+                pool.append(tok)
+        for e in entities:
+            tok = _norm_token(e)
+            if tok and tok in allowed:
+                pool.append(tok)
+        pool = sorted(set(pool))  # unique per row
+        for a, b in itertools.combinations(pool, 2):
+            if a > b:
+                a, b = b, a
+            edges[(a, b)] += 1
+    return edges
+
+
+def _pyvis_html(net: Network) -> str:
+    """Return rendered HTML for a PyVis Network."""
+    if hasattr(net, "generate_html"):
+        return net.generate_html()
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
+        path = tmp.name
+    try:
+        net.write_html(path)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
 
 def build_cooccurrence_graph(
-    results: List[Dict[str, Any]],
-    top_k_terms: int = 25,
+    rows: List[Dict[str, Any]],
+    top_k_terms: int = 50,
     min_edge_weight: int = 2,
-    height: str = "680px",
+    keep_isolates: bool = True,
+    auto_relax_when_empty: bool = True,
+    # PyVis/label styling
+    font_size: int = 20,          # <— bigger labels
+    bold_labels: bool = True,     # <— bold labels
+    physics: bool = True,
+    height: str = "650px",
     width: str = "100%",
     notebook: bool = False,
 ) -> str:
     """
-    IMPORTANT: Do NOT reshape Arabic here. Let the browser handle shaping/bidi.
-    We just pass plain Arabic labels and set a font face in vis options.
+    Build a Co-occurrence network HTML (PyVis) with bigger, bold node labels by default.
     """
-    topics_by_post: List[List[str]] = []
-    for r in results or []:
-        topics = r.get("topics") or []
-        if isinstance(topics, str):
-            # tolerate both JSON and delimited strings
-            try:
-                import json as _json
-                parsed = _json.loads(topics)
-                if isinstance(parsed, list):
-                    topics = [str(x) for x in parsed if x]
-                else:
-                    import re as _re
-                    topics = [t.strip() for t in _re.split(r"[;,/|]+", topics) if t.strip()]
-            except Exception:
-                import re as _re
-                topics = [t.strip() for t in _re.split(r"[;,/|]+", topics) if t.strip()]
-        topics_by_post.append([str(t) for t in topics])
+    try:
+        top_k_terms = max(1, int(top_k_terms))
+    except Exception:
+        top_k_terms = 50
+    try:
+        min_edge_weight = max(1, int(min_edge_weight))
+    except Exception:
+        min_edge_weight = 2
 
-    term_freq, edge_freq = _cooccurrence(topics_by_post)
-    if not term_freq:
-        return "<div style='padding:1rem'>لا توجد مواضيع لبناء الرسم الشبكي.</div>"
+    # 1) term frequencies (unique per row)
+    freq = _collect_terms(rows)
+    if not freq:
+        return "<div style='padding:12px;font:14px Arial'>No terms to show.</div>"
 
-    top_terms = [t for t, _ in term_freq.most_common(max(1, top_k_terms))]
-    top_set = set(top_terms)
+    # 2) select top-K terms
+    top_terms = {w for w, _ in freq.most_common(top_k_terms)} or set(freq.keys())
 
-    net = Network(height=height, width=width, directed=False, notebook=notebook, cdn_resources="in_line")
+    # 3) edges among top terms
+    edges = _cooccur_edges(rows, top_terms)
 
-    # Use an Arabic-capable font stack; browser will pick the first available.
-    vis_options = {
-        "locale": "ar",
-        "interaction": {"hover": True, "tooltipDelay": 120},
-        "nodes": {
-            "shape": "dot",
-            "scaling": {"min": 10, "max": 42},
-            "font": {
-                "size": 16,
-                # Critical: use a CSS stack, not reshaped text.
-                "face": "Tahoma, 'Noto Naskh Arabic', 'Noto Sans Arabic', 'Traditional Arabic', Arial, 'DejaVu Sans', sans-serif"
-            },
-        },
-        "edges": {"smooth": {"type": "continuous"}, "selectionWidth": 2, "hoverWidth": 1.5},
-        "physics": {
-            "enabled": True,
-            "stabilization": {"iterations": 200},
-            "solver": "forceAtlas2Based",
-            "forceAtlas2Based": {"gravitationalConstant": -50, "springLength": 120, "springConstant": 0.06},
-        },
-    }
-    net.set_options(json.dumps(vis_options, ensure_ascii=False))
+    # 4) apply threshold; auto-relax once if nothing survives
+    thr = min_edge_weight
+    filtered_edges = [(a, b, w) for (a, b), w in edges.items() if w >= thr]
+    if not filtered_edges and auto_relax_when_empty and edges:
+        thr = 1
+        filtered_edges = [(a, b, w) for (a, b), w in edges.items() if w >= 1]
 
-    max_freq = max((term_freq[t] for t in top_set), default=1)
-    for t in top_terms:
-        freq = term_freq[t]
-        size = 10 + int(30 * (freq / max_freq))
-        # No arabic_reshaper here — pass raw label
-        net.add_node(n_id=t, label=t, title=f"{t} — {freq}", value=freq, size=size)
+    # 5) build the graph
+    G = nx.Graph()
+    for term in top_terms:
+        G.add_node(term, size=max(10, 10 + 2 * int(freq[term])), freq=int(freq[term]))
+    for a, b, w in filtered_edges:
+        if a in G and b in G:
+            G.add_edge(a, b, weight=int(w))
 
-    for (a, b), w in edge_freq.items():
-        if w < max(1, min_edge_weight):
-            continue
-        if a not in top_set or b not in top_set:
-            continue
-        net.add_edge(a, b, value=w, title=f"{w}", width=1 + (w - 1) * 0.8)
+    if not keep_isolates and G.number_of_edges() > 0:
+        isolates = [n for n, d in G.degree() if d == 0]
+        G.remove_nodes_from(isolates)
 
-    if not net.edges:
-        return "<div style='padding:1rem'>لا توجد حواف بعد الفلترة. خفّض الحد الأدنى.</div>"
+    if G.number_of_nodes() == 0:
+        return (
+            "<div style='padding:12px;font:14px Arial'>"
+            "Not enough co-occurrences to draw a graph. "
+            "Increase <b>Top K terms</b> or lower <b>Min edge weight</b>."
+            "</div>"
+        )
 
-    return net.generate_html(notebook=notebook)
+    # 6) PyVis rendering
+    net = Network(height=height, width=width, directed=False, notebook=notebook)
+    net.barnes_hut(gravity=-20000, central_gravity=0.3, spring_length=120, spring_strength=0.01, damping=0.9)
+    net.toggle_physics(physics)
+
+    # Add nodes with bigger/bold labels (use HTML <b> with font.multi='html')
+    for n, data in G.nodes(data=True):
+        label = f"<b>{n}</b>" if bold_labels else n
+        net.add_node(
+            n,
+            label=label,
+            title=f"{n} — freq={data.get('freq', 0)}",
+            value=data.get("freq", 1),
+        )
+
+    for u, v, data in G.edges(data=True):
+        w = int(data.get("weight", 1))
+        net.add_edge(u, v, value=w, title=f"co-occurrence={w}")
+
+    # Vis-network options (inject font size + enable HTML multi + bold style)
+    net.set_options(f"""
+    {{
+      "nodes": {{
+        "font": {{
+          "size": {int(font_size)},
+          "color": "#111",
+          "face": "arial",
+          "multi": "html",
+          "bold": {{"size": {int(font_size)}, "face": "arial", "mod": "bold", "color": "#111"}}
+        }},
+        "scaling": {{"min": 10, "max": 70}}
+      }},
+      "edges": {{
+        "color": {{"color": "#9ab"}},
+        "smooth": false
+      }},
+      "physics": {{
+        "enabled": true,
+        "barnesHut": {{
+          "gravitationalConstant": -20000,
+          "centralGravity": 0.3,
+          "springLength": 120,
+          "springConstant": 0.01,
+          "avoidOverlap": 0.2
+        }},
+        "timestep": 0.5,
+        "stabilization": {{"iterations": 100}}
+      }},
+      "interaction": {{
+        "hover": true,
+        "tooltipDelay": 100
+      }}
+    }}
+    """)
+
+    node_count = G.number_of_nodes()
+    edge_count = G.number_of_edges()
+    info_html = (
+        f"<div class='legend' style='padding:8px 12px; font:12px Arial; color:#555;'>"
+        f"nodes={node_count}, edges={edge_count}, min_edge_weight={thr}, top_k_terms={len(top_terms)}"
+        f"</div>"
+    )
+
+    html = _pyvis_html(net)
+    if "</body>" in html:
+        html = html.replace("</body>", info_html + "</body>")
+    else:
+        html += info_html
+    return html

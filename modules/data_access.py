@@ -1,51 +1,54 @@
 from __future__ import annotations
-from typing import Optional
-import sqlite3
+import os, sqlite3
+from typing import Optional, Tuple, List
 import pandas as pd
-from .config import DB_PATH
-from utils.sqlite_client import ensure_schema
 
-def fetch_telegram_posts(limit: int = 500,
-                         since_utc: Optional[str] = None,
-                         until_utc: Optional[str] = None,
-                         search: Optional[str] = None) -> pd.DataFrame:
-    """
-    Read posts from local SQLite DB where platform='Telegram'.
-    Ensures schema exists before querying.
-    """
-    # Make sure the table exists (fixes "no such table: posts")
-    ensure_schema(DB_PATH)
+from .config import DB_PATH, S
+from utils.sqlite_client import connect
 
-    con = sqlite3.connect(DB_PATH)
-    try:
-        q = """
+def _where_clause(
+    since_utc: Optional[str],
+    until_utc: Optional[str],
+    search: Optional[str],
+) -> Tuple[str, List]:
+    clauses = ["1=1"]
+    params: List = []
+    if since_utc:
+        clauses.append("datetime_utc >= ?")
+        params.append(since_utc)
+    if until_utc:
+        clauses.append("datetime_utc <= ?")
+        params.append(until_utc)
+    if search:
+        clauses.append("INSTR(COALESCE(text,''), ?) > 0")
+        params.append(search)
+    return " AND ".join(clauses), params
+
+def count_telegram_posts(
+    since_utc: Optional[str] = None,
+    until_utc: Optional[str] = None,
+    search: Optional[str] = None,
+) -> int:
+    where_sql, params = _where_clause(since_utc, until_utc, search)
+    sql = f"SELECT COUNT(1) FROM posts WHERE source_name='telegram' AND {where_sql};"
+    with connect() as con:
+        row = con.execute(sql, params).fetchone()
+        return int(row[0] if row else 0)
+
+def fetch_telegram_posts(
+    limit: int = 100,
+    since_utc: Optional[str] = None,
+    until_utc: Optional[str] = None,
+    search: Optional[str] = None,
+) -> pd.DataFrame:
+    where_sql, params = _where_clause(since_utc, until_utc, search)
+    sql = f"""
         SELECT
-          id, platform, platform_post_id, source_name, source_url,
-          post_id, post_url, author, text, language,
-          datetime_utc, collected_at_utc, likes, shares, comments, hash
+            id, datetime_utc, source_name, author, text, likes, shares, comments
         FROM posts
-        WHERE platform='Telegram'
-        """
-        params = []
-
-        if since_utc:
-            q += " AND datetime_utc >= ?"
-            params.append(since_utc)
-        if until_utc:
-            q += " AND datetime_utc <= ?"
-            params.append(until_utc)
-        if search:
-            q += " AND text LIKE ?"
-            params.append(f"%{search}%")
-
-        q += " ORDER BY datetime_utc DESC LIMIT ?"
-        params.append(int(limit))
-
-        df = pd.read_sql_query(q, con, params=params)
-    finally:
-        con.close()
-
-    for col in ("datetime_utc", "collected_at_utc"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
-    return df
+        WHERE source_name='telegram' AND {where_sql}
+        ORDER BY datetime_utc DESC
+        LIMIT ?
+    """
+    with connect() as con:
+        return pd.read_sql_query(sql, con, params=params + [int(limit)])
