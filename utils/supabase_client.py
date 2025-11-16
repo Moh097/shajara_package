@@ -1,79 +1,153 @@
 # utils/supabase_client.py
-# Supabase REST helper with numeric coercion + (platform,platform_post_id) conflict
-import os, time, json, requests
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+from __future__ import annotations
 
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
-}
+import os
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
-_NUMERIC_FIELDS = {"shares", "likes", "comments"}
+import requests
 
-def _to_int_or_none(v):
-    if v is None:
-        return None
-    if isinstance(v, int):
-        return v
-    try:
-        s = str(v)
-        digits = "".join(ch for ch in s if ch.isdigit())
-        return int(digits) if digits else None
-    except Exception:
-        return None
+from modules.config import S
 
-def _clean_row(row: dict) -> dict:
-    out = {}
-    for k, v in (row or {}).items():
-        if k in _NUMERIC_FIELDS:
-            out[k] = _to_int_or_none(v)
-            continue
-        if v is None:
-            out[k] = None
-            continue
-        try:
-            json.dumps(v)
-            out[k] = v
-        except Exception:
-            out[k] = str(v)
-    return out
+log = logging.getLogger("supabase_client")
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
 
-def upsert_posts(rows, batch_size=50, max_retries=3, on_conflict="platform,platform_post_id"):
-    if not rows:
-        return
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise RuntimeError("SUPABASE_URL and SUPABASE_ANON_KEY are required.")
 
-    url = f"{SUPABASE_URL}/rest/v1/posts"
-    params = {"on_conflict": on_conflict}
-    clean_rows = [_clean_row(r) for r in rows]
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
-    for i in range(0, len(clean_rows), batch_size):
-        batch = clean_rows[i:i+batch_size]
-        attempt = 0
-        while True:
-            attempt += 1
+def _get_supabase_config() -> Tuple[str, str]:
+    """
+    Returns (url, key) from env or .streamlit/secrets.toml.
+
+    Supports:
+      - SUPABASE_URL
+      - SUPABASE_SERVICE_ROLE_KEY (preferred if present)
+      - SUPABASE_ANON_KEY        (fallback – what you're using now)
+    """
+    url = (S("SUPABASE_URL", os.environ.get("SUPABASE_URL", "")) or "").rstrip("/")
+    key = (
+        S("SUPABASE_SERVICE_ROLE_KEY", os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))  # if you ever add it
+        or S("SUPABASE_ANON_KEY", os.environ.get("SUPABASE_ANON_KEY", ""))               # currently used
+        or ""
+    )
+    if not url or not key:
+        raise RuntimeError(
+            "Supabase config missing: SUPABASE_URL or "
+            "SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY not set "
+            "(env or .streamlit/secrets.toml)."
+        )
+    return url, key
+
+
+def _base_headers(*, count: bool = False) -> Dict[str, str]:
+    _, key = _get_supabase_config()
+    headers: Dict[str, str] = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+    }
+    if count:
+        # Ask PostgREST for exact total using Content-Range
+        headers["Prefer"] = "count=exact"
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def select(
+    table: str,
+    params: Dict[str, Any],
+    *,
+    count: bool = False,
+    timeout: int = 30,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """
+    Generic SELECT wrapper around Supabase REST (PostgREST).
+    """
+    base_url, _ = _get_supabase_config()
+    url = f"{base_url}/rest/v1/{table}"
+
+    log.debug("Supabase SELECT %s params=%s", table, params)
+    resp = requests.get(
+        url,
+        headers=_base_headers(count=count),
+        params=params,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+
+    total: Optional[int] = None
+    if count:
+        cr = resp.headers.get("Content-Range")
+        if cr and "/" in cr:
+            # Content-Range: 0-0/1234
             try:
-                resp = requests.post(url, params=params, headers=HEADERS, data=json.dumps(batch), timeout=60)
-                if resp.status_code in (200, 201):
-                    break
-                if resp.status_code == 409:
-                    # fall back row-by-row to skip dupes
-                    for row in batch:
-                        r1 = requests.post(url, params=params, headers=HEADERS, data=json.dumps([row]), timeout=60)
-                        if r1.status_code not in (200, 201, 409):
-                            raise Exception(f"Row insert failed: {r1.status_code} {r1.text}")
-                    break
-                if attempt < max_retries:
-                    time.sleep(min(2 ** attempt, 8))
-                    continue
-                raise Exception(f"Batch insert failed after retries: {resp.status_code} {resp.text}")
-            except requests.RequestException as e:
-                if attempt < max_retries:
-                    time.sleep(min(2 ** attempt, 8))
-                    continue
-                raise e
+                total = int(cr.split("/")[-1])
+            except ValueError:
+                total = None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = []
+
+    if isinstance(data, dict):
+        data = [data]
+
+    return data, total
+
+
+def upsert(
+    table: str,
+    rows: List[Dict[str, Any]],
+    *,
+    timeout: int = 60,
+) -> int:
+    """
+    Generic UPSERT (insert/update) into Supabase.
+
+    Used by collectors to push rows into `posts`.
+    Returns the number of rows Supabase reports back.
+    """
+    if not rows:
+        return 0
+
+    base_url, _ = _get_supabase_config()
+    url = f"{base_url}/rest/v1/{table}"
+
+    headers = _base_headers()
+    headers.update(
+        {
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=representation",
+        }
+    )
+
+    payload = json.dumps(rows, ensure_ascii=False)
+    log.debug("Supabase UPSERT %s rows=%d", table, len(rows))
+
+    resp = requests.post(
+        url,
+        headers=headers,
+        data=payload.encode("utf-8"),
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = []
+
+    if isinstance(data, list):
+        return len(data)
+    return len(rows)

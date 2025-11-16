@@ -1,144 +1,174 @@
 # collectors/facebook_collector.py
-# Facebook → SQLite (facebook_scraper; env-only)
 
-# --- ensure repo root in PYTHONPATH ---
-import os, sys
-HERE = os.path.dirname(__file__)
-CANDIDATE = os.path.abspath(os.path.join(HERE, ".."))
-if os.path.isdir(os.path.join(CANDIDATE, "utils")) and CANDIDATE not in sys.path:
-    sys.path.insert(0, CANDIDATE)
-else:
-    REPO_ROOT = os.path.abspath(os.getcwd())
-    if REPO_ROOT not in sys.path:
-        sys.path.insert(0, REPO_ROOT)
-# ---
+from __future__ import annotations
 
-import re, json, hashlib
-from datetime import datetime, timezone
-from typing import Iterable, Dict, Any, Tuple, Optional
+import os
+import json
+import logging
+from typing import Any, Dict, List
+from pathlib import Path
 
-from facebook_scraper import get_posts, set_user_agent
-from utils.sqlite_client import upsert_posts, ensure_schema
-from modules.config import DB_PATH
+try:
+    from facebook_scraper import get_posts
+except ImportError:
+    get_posts = None  # we’ll handle this gracefully
 
-PAGE_URLS = [u.strip() for u in os.environ.get("FB_PAGES", "https://www.facebook.com/Suwayda24,https://www.facebook.com/groups/zero0nine9").split(",") if u.strip()]
-POSTS_LIMIT = int(os.environ.get("FB_LIMIT", "200") or 200)
-USER_AGENT = os.environ.get("FB_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-FB_COOKIES_JSON = os.environ.get("FB_COOKIES_JSON", "").strip()
-set_user_agent(USER_AGENT)
+from modules.config import S
+from utils.supabase_client import upsert
 
-def _parse_cookies(raw: str) -> Optional[dict]:
-    if not raw: return None
+log = logging.getLogger("facebook_collector")
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+
+PKG_ROOT = Path(__file__).resolve().parents[1]
+POSTS_TABLE = os.environ.get("SHAJARA_TABLE_NAME", S("SHAJARA_TABLE_NAME", "posts")) or "posts"
+
+
+def _parse_list(raw: str) -> List[str]:
+    raw = raw.strip()
+    if not raw:
+        return []
     try:
         obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
         if isinstance(obj, list):
-            jar = {}
-            for c in obj:
-                n, v = c.get("name"), c.get("value")
-                if n and v is not None: jar[n] = v
-            return jar or None
+            return [str(x).strip() for x in obj if str(x).strip()]
     except Exception:
-        return None
+        pass
+    parts = [p.strip() for p in raw.replace("\r", "").replace("\n", ",").split(",")]
+    return [p for p in parts if p]
 
-COOKIES = _parse_cookies(FB_COOKIES_JSON)
 
-def _identify(url: str):
-    if not url: return "unknown", "", url
-    from urllib.parse import urlparse, parse_qs
-    url = re.sub(r"^(https?://)(m\.|mbasic\.)?facebook\.com", r"\1www.facebook.com", url.strip())
-    p = urlparse(url)
-    path = (p.path or "").strip("/")
-    if not path:
-        return "account", "", url
-    if path.startswith("groups/"):
-        parts = path.split("/")
-        ident = parts[1] if len(parts) > 1 else ""
-        return "group", ident, f"https://www.facebook.com/groups/{ident}"
-    if "profile.php" in (p.path or ""):
-        q = parse_qs(p.query or "")
-        pid = q.get("id", [""])[0]
-        return "account", pid, f"https://www.facebook.com/profile.php?id={pid}"
-    m = re.search(r"/people/[^/]+/(\d+)", p.path or "")
-    if m:
-        pid = m.group(1)
-        return "account", pid, f"https://www.facebook.com/people/x/{pid}"
-    ident = path.split("/")[0]
-    return "account", ident, f"https://www.facebook.com/{ident}"
+def _load_env_list(key: str) -> List[str]:
+    # 1) explicit env wins
+    raw_env = os.environ.get(key)
+    if raw_env is not None and str(raw_env).strip():
+        return _parse_list(str(raw_env))
 
-def _row_from_post(post: Dict[str, Any], source_name: str, source_url: str) -> Dict[str, Any]:
-    text = (post.get("text") or "").strip()
-    t = post.get("time")
-    if isinstance(t, datetime):
-        dt_utc = t.astimezone(timezone.utc).isoformat()
-    else:
-        dt_utc = None
+    # 2) .streamlit/channels.json for TELEGRAM_CHANNELS (reused as Facebook pages)
+    if key == "TELEGRAM_CHANNELS":
+        ch_file = PKG_ROOT / ".streamlit" / "channels.json"
+        if ch_file.exists():
+            try:
+                arr = json.loads(ch_file.read_text(encoding="utf-8"))
+                if isinstance(arr, list):
+                    return [str(x).strip() for x in arr if str(x).strip()]
+            except Exception:
+                pass
 
-    imgs = post.get("images") or []
-    if isinstance(imgs, str):
-        media = imgs
-    else:
-        try: media = ",".join(imgs) if imgs else ""
-        except Exception: media = ""
+    # 3) secrets.toml via S()
+    raw_secret = S(key, "") or ""
+    if raw_secret:
+        return _parse_list(str(raw_secret))
 
-    return {
-        "platform": "Facebook",
-        "platform_post_id": str(post.get("post_id") or ""),
-        "source_name": source_name or (post.get("username") or ""),
-        "source_url": source_url,
-        "post_id": str(post.get("post_id") or ""),
-        "post_url": post.get("post_url") or "",
-        "author": post.get("username") or "",
-        "text": text,
-        "language": "",
-        "datetime_utc": dt_utc,
-        "datetime_local": "",
-        "admin_area": "",
-        "locality": "",
-        "geofenced_area": "",
-        "tension_level": "",
-        "media_urls": media,
-        "shares": post.get("shares"),
-        "likes": post.get("likes"),
-        "comments": post.get("comments"),
-        "collected_at_utc": datetime.utcnow().isoformat(),
-        "collector": "SHAJARA-Agent",
-        "hash": hashlib.sha256((text or "").encode("utf-8")).hexdigest() if text else None,
-        "notes": "",
-    }
+    return []
 
-def _iter_source_posts(url: str, limit: int):
-    kind, ident, canonical = _identify(url)
-    if not ident: return []
-    opts = {"posts_per_page": 200}
-    rows = 0
-    gen = get_posts(group=ident, cookies=COOKIES, options=opts, pages=1000) if kind=="group" else get_posts(ident, cookies=COOKIES, options=opts, pages=1000)
-    for post in gen:
-        yield _row_from_post(post, source_name=(f"group:{ident}" if kind == "group" else ident), source_url=canonical)
-        rows += 1
-        if rows >= limit: break
+
+def _match_search_terms(text: str, terms: List[str]) -> bool:
+    if not terms:
+        return True
+    t = text or ""
+    if not t:
+        return False
+    lower = t.lower()
+    for term in terms:
+        if not term:
+            continue
+        if term.lower() in lower:
+            return True
+    return False
+
+
+def run_facebook_collector() -> None:
+    if get_posts is None:
+        print("facebook_scraper not installed; skipping Facebook collector.")
+        print("Upserted 0 rows")
+        return
+
+    # Reuse TELEGRAM_* env as generic "sources" for FB too
+    pages = _load_env_list("TELEGRAM_CHANNELS")
+    search_terms = _load_env_list("TELEGRAM_SEARCH_TERMS")
+
+    limit_raw = os.environ.get("TELEGRAM_LIMIT")
+    if not (limit_raw and str(limit_raw).strip()):
+        limit_raw = S("TELEGRAM_LIMIT", S("TELEGRAM_MAX_FETCH", "1000"))
+    try:
+        limit = int(str(limit_raw))
+    except Exception:
+        limit = 1000
+
+    if not pages:
+        print("No Facebook pages configured (using TELEGRAM_CHANNELS). Nothing to do.")
+        print("Upserted 0 rows")
+        return
+
+    print(f"Using Facebook pages: {pages}")
+    print(f"Search terms: {search_terms or '∅'}")
+    print(f"Per-page limit: {limit}")
+
+    all_rows: List[Dict[str, Any]] = []
+
+    for page in pages:
+        page = page.strip()
+        if not page:
+            continue
+
+        fetched = 0
+        rows_for_page: List[Dict[str, Any]] = []
+
+        try:
+            for post in get_posts(page=page, pages=1, extra_info=True):
+                if fetched >= limit:
+                    break
+
+                text = (post.get("text") or "") + " " + (post.get("post_text") or "")
+                if not _match_search_terms(text, search_terms):
+                    continue
+
+                dt = post.get("time")
+                if dt is not None:
+                    dt_iso = dt.isoformat()
+                else:
+                    dt_iso = None
+
+                row = {
+                    "platform": "facebook",
+                    "source_name": page,
+                    "source_id": str(post.get("post_id") or ""),
+                    "datetime_utc": dt_iso,
+                    "author": post.get("username") or post.get("user_id") or None,
+                    "text": text,
+                    "likes": int(post.get("likes") or 0),
+                    "shares": int(post.get("shares") or 0),
+                    "comments": int(post.get("comments") or 0),
+                    "raw": {
+                        "post_url": post.get("post_url"),
+                    },
+                }
+
+                rows_for_page.append(row)
+                fetched += 1
+
+        except Exception as e:
+            log.error("Failed scraping Facebook page %s: %s", page, e)
+            continue
+
+        print(f"Channel {page} -> fetched {fetched} messages")
+        all_rows.extend(rows_for_page)
+
+    if not all_rows:
+        print("Upserted 0 rows (no Facebook posts matched filters)")
+        return
+
+    inserted = upsert(POSTS_TABLE, all_rows)
+    print(f"Upserted {inserted} rows")
+
 
 def main():
-    ensure_schema(DB_PATH)
-    all_rows = []
-    for u in PAGE_URLS:
-        try:
-            for row in _iter_source_posts(u, POSTS_LIMIT):
-                all_rows.append(row)
-                if len(all_rows) >= POSTS_LIMIT: break
-        except Exception as e:
-            print(f"Warning: failed scraping {u}: {e}")
-        if len(all_rows) >= POSTS_LIMIT: break
+    run_facebook_collector()
 
-    if all_rows:
-        try:
-            n = upsert_posts(all_rows, db_path=DB_PATH)
-            print(f"Upserted {n} Facebook rows into SQLite: {DB_PATH}")
-        except Exception as e:
-            print(f"ERROR: SQLite upsert failed: {e}")
-    else:
-        print("No Facebook rows collected.")
 
 if __name__ == "__main__":
     main()
